@@ -1,133 +1,1607 @@
+<?php
+/**
+ * =============================================================================
+ * VIDEOCHAT.PHP — Одностраничный WebRTC видео+текст чат для 2 пользователей
+ * =============================================================================
+ *
+ * ДЕПЛОЙ:
+ *   1. Загрузите этот файл на PHP-хостинг (например, в корень сайта).
+ *   2. Убедитесь, что PHP может создавать файлы в той же директории
+ *      (права 755/775 на папку). state.json будет создан автоматически.
+ *   3. Откройте в браузере: https://yourdomain.com/videochat.php
+ *   4. Откройте второй браузер/вкладку — он получит slot2 и начнётся звонок.
+ *
+ * ТЕСТИРОВАНИЕ:
+ *   - Откройте два разных браузера (не две вкладки одного) или инкогнито.
+ *   - Первый → slot1 (caller), второй → slot2 (callee).
+ *   - Caller создаёт offer автоматически, callee получает его через polling.
+ *   - Для отладки добавьте ?debug=1 в URL — покажет state.json.
+ *   - При закрытии вкладки слот освобождается через heartbeat-таймаут (~12с).
+ *
+ * НАСТРОЙКИ:
+ *   Редактируйте константы ниже для изменения поведения приложения.
+ * =============================================================================
+ */
+
+// ─── КОНФИГУРАЦИЯ ─────────────────────────────────────────────────────────────
+
+define('STATE_FILE',        __DIR__ . '/state.json');   // Файл состояния
+define('PING_TIMEOUT',      15);    // Секунд до считания клиента отключённым
+define('MAX_ICE_QUEUE',     200);   // Макс. ICE-кандидатов в очереди
+define('MAX_MSGS',          200);   // Макс. сообщений чата
+define('MAX_SIGNAL_QUEUE',  10);    // Макс. offer/answer в очереди
+define('STUN_SERVER',       'stun:stun.l.google.com:19302'); // STUN сервер
+
+// ─── ОБРАБОТКА AJAX-ЗАПРОСОВ ──────────────────────────────────────────────────
+
+$action = $_REQUEST['action'] ?? null;
+
+// Режим отладки — показывает state.json (только для разработки!)
+if (isset($_GET['debug']) && $_GET['debug'] === '1') {
+    header('Content-Type: application/json; charset=utf-8');
+    $state = readState();
+    // Добавляем текущее время для расчёта ping-timeout'ов
+    $state['_now'] = time();
+    $state['_ping_timeout'] = PING_TIMEOUT;
+    echo json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// Если есть action — это AJAX запрос, обрабатываем и выходим
+if ($action !== null) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+
+    try {
+        switch ($action) {
+            case 'join':      echo json_encode(handleJoin());     break;
+            case 'ping':      echo json_encode(handlePing());     break;
+            case 'leave':     echo json_encode(handleLeave());    break;
+            case 'post_offer':  echo json_encode(handlePostOffer()); break;
+            case 'post_answer': echo json_encode(handlePostAnswer()); break;
+            case 'post_ice':  echo json_encode(handlePostIce());  break;
+            case 'poll':      echo json_encode(handlePoll());     break;
+            case 'post_msg':  echo json_encode(handlePostMsg());  break;
+            default:
+                http_response_code(400);
+                echo json_encode(['status' => 'error', 'message' => 'Unknown action']);
+        }
+    } catch (Throwable $e) {
+        http_response_code(500);
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// ─── ФУНКЦИИ РАБОТЫ С STATE.JSON ──────────────────────────────────────────────
+
+/**
+ * Читает state.json с блокировкой.
+ * Возвращает распарсенный массив состояния.
+ */
+function readState(): array {
+    if (!file_exists(STATE_FILE)) {
+        return defaultState();
+    }
+    $fp = fopen(STATE_FILE, 'r+');
+    if (!$fp) throw new RuntimeException('Cannot open state file for reading');
+    flock($fp, LOCK_SH);
+    $content = stream_get_contents($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    if (empty($content)) return defaultState();
+    $state = json_decode($content, true);
+    return is_array($state) ? $state : defaultState();
+}
+
+/**
+ * Атомарно читает и обновляет state.json с эксклюзивной блокировкой.
+ * $callback получает текущий state, должен вернуть новый state.
+ */
+function updateState(callable $callback): array {
+    // Создаём файл если не существует
+    $fp = fopen(STATE_FILE, file_exists(STATE_FILE) ? 'r+' : 'w+');
+    if (!$fp) throw new RuntimeException('Cannot open state file for writing');
+
+    flock($fp, LOCK_EX); // Эксклюзивная блокировка
+
+    $content = stream_get_contents($fp);
+    rewind($fp);
+
+    $state = (!empty($content)) ? (json_decode($content, true) ?? defaultState()) : defaultState();
+
+    // Очищаем протухшие слоты перед каждой операцией
+    $state = expireSlots($state);
+
+    // Применяем обновление
+    $newState = $callback($state);
+    $newState['updated'] = time();
+
+    // Записываем обратно
+    ftruncate($fp, 0);
+    fwrite($fp, json_encode($newState, JSON_UNESCAPED_UNICODE));
+
+    flock($fp, LOCK_UN);
+    fclose($fp);
+
+    return $newState;
+}
+
+/**
+ * Структура state.json по умолчанию.
+ * slot1/slot2 — данные двух абонентов.
+ * msgs — общая очередь сообщений чата.
+ */
+function defaultState(): array {
+    return [
+        'slot1' => emptySlot(),
+        'slot2' => emptySlot(),
+        'msgs'  => [],          // Общие сообщения чата [{from,text,ts}]
+        'created' => time(),
+        'updated' => time(),
+    ];
+}
+
+/** Пустая структура слота */
+function emptySlot(): array {
+    return [
+        'clientId'  => null,    // Уникальный ID клиента
+        'lastPing'  => 0,       // Unix timestamp последнего пинга
+        'offers'    => [],      // SDP offer для этого слота
+        'answers'   => [],      // SDP answer для этого слота
+        'ices'      => [],      // ICE-кандидаты для этого слота
+    ];
+}
+
+/**
+ * Очищает слоты у которых истёк таймаут пинга.
+ * Вызывается автоматически перед каждым updateState.
+ */
+function expireSlots(array $state): array {
+    $now = time();
+    foreach (['slot1', 'slot2'] as $slot) {
+        if (!empty($state[$slot]['clientId'])) {
+            $lastPing = $state[$slot]['lastPing'] ?? 0;
+            if ($now - $lastPing > PING_TIMEOUT) {
+                $state[$slot] = emptySlot();
+            }
+        }
+    }
+    return $state;
+}
+
+// ─── ОБРАБОТЧИКИ ENDPOINTS ────────────────────────────────────────────────────
+
+/**
+ * action=join
+ * Регистрирует нового клиента. Назначает слот 1 или 2.
+ * Если оба заняты — возвращает status=busy.
+ * Body: clientId (опционально, для переподключения)
+ */
+function handleJoin(): array {
+    $clientId = $_POST['clientId'] ?? $_GET['clientId'] ?? null;
+
+    $result = null;
+
+    updateState(function($state) use ($clientId, &$result) {
+        $now = time();
+
+        // Если clientId уже есть в одном из слотов — переподключение
+        foreach (['slot1', 'slot2'] as $slotKey) {
+            if ($state[$slotKey]['clientId'] === $clientId && $clientId !== null) {
+                // Обновляем пинг и возвращаем тот же слот
+                $state[$slotKey]['lastPing'] = $now;
+                $peerSlot = ($slotKey === 'slot1') ? 'slot2' : 'slot1';
+                $result = [
+                    'status'   => 'ok',
+                    'slot'     => (int)substr($slotKey, 4),
+                    'clientId' => $clientId,
+                    'peerSlot' => (int)substr($peerSlot, 4),
+                    'peerConnected' => !empty($state[$peerSlot]['clientId']),
+                    'reconnected' => true,
+                ];
+                return $state;
+            }
+        }
+
+        // Назначаем первый свободный слот
+        $assignedSlot = null;
+        if (empty($state['slot1']['clientId'])) {
+            $assignedSlot = 'slot1';
+        } elseif (empty($state['slot2']['clientId'])) {
+            $assignedSlot = 'slot2';
+        }
+
+        if ($assignedSlot === null) {
+            $result = ['status' => 'busy'];
+            return $state;
+        }
+
+        // Генерируем новый clientId если не передан
+        if (!$clientId) {
+            $clientId = bin2hex(random_bytes(8));
+        }
+
+        $state[$assignedSlot] = emptySlot();
+        $state[$assignedSlot]['clientId'] = $clientId;
+        $state[$assignedSlot]['lastPing'] = $now;
+
+        $peerSlot = ($assignedSlot === 'slot1') ? 'slot2' : 'slot1';
+
+        $result = [
+            'status'   => 'ok',
+            'slot'     => (int)substr($assignedSlot, 4),
+            'clientId' => $clientId,
+            'peerSlot' => (int)substr($peerSlot, 4),
+            'peerConnected' => !empty($state[$peerSlot]['clientId']),
+            'reconnected' => false,
+        ];
+
+        return $state;
+    });
+
+    return $result;
+}
+
+/**
+ * action=ping
+ * Обновляет lastPing для клиента. Поддерживает слот живым.
+ */
+function handlePing(): array {
+    $clientId = $_POST['clientId'] ?? $_GET['clientId'] ?? null;
+    $slot = (int)($_POST['slot'] ?? $_GET['slot'] ?? 0);
+
+    if (!$clientId || !$slot) return ['status' => 'error', 'message' => 'Missing params'];
+
+    $slotKey = 'slot' . $slot;
+    $found = false;
+
+    updateState(function($state) use ($clientId, $slotKey, &$found) {
+        if (($state[$slotKey]['clientId'] ?? null) === $clientId) {
+            $state[$slotKey]['lastPing'] = time();
+            $found = true;
+        }
+        return $state;
+    });
+
+    return $found ? ['status' => 'ok'] : ['status' => 'error', 'message' => 'Slot not found'];
+}
+
+/**
+ * action=leave
+ * Явный выход клиента — очищает его слот.
+ */
+function handleLeave(): array {
+    $clientId = $_POST['clientId'] ?? $_GET['clientId'] ?? null;
+    $slot = (int)($_POST['slot'] ?? $_GET['slot'] ?? 0);
+
+    if (!$clientId || !$slot) return ['status' => 'error', 'message' => 'Missing params'];
+
+    $slotKey = 'slot' . $slot;
+
+    updateState(function($state) use ($clientId, $slotKey) {
+        if (($state[$slotKey]['clientId'] ?? null) === $clientId) {
+            $state[$slotKey] = emptySlot();
+        }
+        return $state;
+    });
+
+    return ['status' => 'ok'];
+}
+
+/**
+ * action=post_offer
+ * Caller (slot1) публикует SDP offer для callee (slot2).
+ * Offer сохраняется в slot2.offers — т.е. очередь входящих для slot2.
+ */
+function handlePostOffer(): array {
+    $clientId = $_POST['clientId'] ?? null;
+    $slot = (int)($_POST['slot'] ?? 0);
+    $offer = $_POST['offer'] ?? null; // JSON-строка SDP
+
+    if (!$clientId || !$slot || !$offer) return ['status' => 'error', 'message' => 'Missing params'];
+
+    $mySlotKey   = 'slot' . $slot;
+    $peerSlotKey = 'slot' . (($slot === 1) ? 2 : 1);
+
+    updateState(function($state) use ($clientId, $mySlotKey, $peerSlotKey, $offer) {
+        if (($state[$mySlotKey]['clientId'] ?? null) !== $clientId) return $state;
+        // Кладём offer в очередь входящих для peer
+        if (count($state[$peerSlotKey]['offers']) < MAX_SIGNAL_QUEUE) {
+            $state[$peerSlotKey]['offers'][] = $offer;
+        }
+        return $state;
+    });
+
+    return ['status' => 'ok'];
+}
+
+/**
+ * action=post_answer
+ * Callee (slot2) публикует SDP answer для caller (slot1).
+ */
+function handlePostAnswer(): array {
+    $clientId = $_POST['clientId'] ?? null;
+    $slot = (int)($_POST['slot'] ?? 0);
+    $answer = $_POST['answer'] ?? null;
+
+    if (!$clientId || !$slot || !$answer) return ['status' => 'error', 'message' => 'Missing params'];
+
+    $mySlotKey   = 'slot' . $slot;
+    $peerSlotKey = 'slot' . (($slot === 1) ? 2 : 1);
+
+    updateState(function($state) use ($clientId, $mySlotKey, $peerSlotKey, $answer) {
+        if (($state[$mySlotKey]['clientId'] ?? null) !== $clientId) return $state;
+        if (count($state[$peerSlotKey]['answers']) < MAX_SIGNAL_QUEUE) {
+            $state[$peerSlotKey]['answers'][] = $answer;
+        }
+        return $state;
+    });
+
+    return ['status' => 'ok'];
+}
+
+/**
+ * action=post_ice
+ * Добавляет ICE-кандидата в очередь для peer.
+ */
+function handlePostIce(): array {
+    $clientId   = $_POST['clientId'] ?? null;
+    $slot       = (int)($_POST['slot'] ?? 0);
+    $candidate  = $_POST['candidate'] ?? null;
+
+    if (!$clientId || !$slot || !$candidate) return ['status' => 'error', 'message' => 'Missing params'];
+
+    $mySlotKey   = 'slot' . $slot;
+    $peerSlotKey = 'slot' . (($slot === 1) ? 2 : 1);
+
+    updateState(function($state) use ($clientId, $mySlotKey, $peerSlotKey, $candidate) {
+        if (($state[$mySlotKey]['clientId'] ?? null) !== $clientId) return $state;
+        if (count($state[$peerSlotKey]['ices']) < MAX_ICE_QUEUE) {
+            $state[$peerSlotKey]['ices'][] = $candidate;
+        }
+        return $state;
+    });
+
+    return ['status' => 'ok'];
+}
+
+/**
+ * action=poll
+ * Главный polling endpoint. Возвращает все накопленные события для клиента:
+ * - offers, answers — SDP сигналинг
+ * - ices — ICE кандидаты
+ * - msgs — новые сообщения чата (с offset)
+ * - peerConnected/peerLeft — состояние peer
+ * После возврата очищает очереди signals (offers/answers/ices).
+ */
+function handlePoll(): array {
+    $clientId  = $_POST['clientId'] ?? $_GET['clientId'] ?? null;
+    $slot      = (int)($_POST['slot'] ?? $_GET['slot'] ?? 0);
+    $msgOffset = (int)($_POST['msgOffset'] ?? $_GET['msgOffset'] ?? 0);
+
+    if (!$clientId || !$slot) return ['status' => 'error', 'message' => 'Missing params'];
+
+    $mySlotKey   = 'slot' . $slot;
+    $peerSlotKey = 'slot' . (($slot === 1) ? 2 : 1);
+
+    $pollResult = null;
+
+    updateState(function($state) use ($clientId, $mySlotKey, $peerSlotKey, $msgOffset, &$pollResult) {
+        if (($state[$mySlotKey]['clientId'] ?? null) !== $clientId) {
+            $pollResult = ['status' => 'error', 'message' => 'Not authorized'];
+            return $state;
+        }
+
+        // Обновляем пинг при каждом poll
+        $state[$mySlotKey]['lastPing'] = time();
+
+        // Забираем очереди сигналов
+        $offers  = $state[$mySlotKey]['offers'];
+        $answers = $state[$mySlotKey]['answers'];
+        $ices    = $state[$mySlotKey]['ices'];
+
+        // Очищаем после получения
+        $state[$mySlotKey]['offers']  = [];
+        $state[$mySlotKey]['answers'] = [];
+        $state[$mySlotKey]['ices']    = [];
+
+        // Новые сообщения чата начиная с offset
+        $allMsgs = $state['msgs'] ?? [];
+        $newMsgs = array_slice($allMsgs, $msgOffset);
+
+        // Ограничиваем общий размер истории чата
+        if (count($allMsgs) > MAX_MSGS) {
+            $state['msgs'] = array_slice($allMsgs, -MAX_MSGS);
+        }
+
+        // Состояние peer
+        $peerConnected = !empty($state[$peerSlotKey]['clientId']);
+        $peerLastPing  = $state[$peerSlotKey]['lastPing'] ?? 0;
+
+        $pollResult = [
+            'status'        => 'ok',
+            'offers'        => $offers,
+            'answers'       => $answers,
+            'ices'          => $ices,
+            'msgs'          => $newMsgs,
+            'msgTotal'      => count($allMsgs),
+            'peerConnected' => $peerConnected,
+            'peerLastPing'  => $peerLastPing,
+            'serverTime'    => time(),
+        ];
+
+        return $state;
+    });
+
+    return $pollResult ?? ['status' => 'error'];
+}
+
+/**
+ * action=post_msg
+ * Добавляет текстовое сообщение в общий чат.
+ */
+function handlePostMsg(): array {
+    $clientId = $_POST['clientId'] ?? null;
+    $slot     = (int)($_POST['slot'] ?? 0);
+    $text     = $_POST['text'] ?? '';
+
+    if (!$clientId || !$slot) return ['status' => 'error', 'message' => 'Missing params'];
+    if (trim($text) === '') return ['status' => 'error', 'message' => 'Empty message'];
+
+    // Санитизация: обрезаем и удаляем управляющие символы
+    $text = mb_substr(trim($text), 0, 1000);
+
+    $slotKey = 'slot' . $slot;
+
+    updateState(function($state) use ($clientId, $slotKey, $slot, $text) {
+        if (($state[$slotKey]['clientId'] ?? null) !== $clientId) return $state;
+
+        $state['msgs'][] = [
+            'from' => $slot,
+            'text' => $text,
+            'ts'   => time(),
+        ];
+
+        // Обрезаем историю
+        if (count($state['msgs']) > MAX_MSGS) {
+            $state['msgs'] = array_slice($state['msgs'], -MAX_MSGS);
+        }
+
+        return $state;
+    });
+
+    return ['status' => 'ok'];
+}
+
+// ─── HTML/CSS/JS ИНТЕРФЕЙС ────────────────────────────────────────────────────
+// Если мы здесь — значит это обычный GET-запрос, отдаём страницу
+?>
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Видеозвонок 1-на-1 (GitHub Pages)</title>
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <style>
-    body {font-family:Arial;background:#111;color:#0f0;text-align:center;margin:0;padding:20px;}
-    video {width:48%;margin:10px;border:3px solid #0f0;border-radius:12px;}
-    #status {font-size:1.8em;margin:20px;}
-    #chat {max-width:500px;margin:20px auto;background:#222;padding:15px;border-radius:10px;}
-    input {width:75%;padding:10px;}
-    button {padding:10px 20px;background:#0f0;color:#000;border:none;cursor:pointer;margin:5px;}
-    #shareLink {background:#333;padding:15px;border-radius:10px;word-break:break-all;}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VideoChat</title>
+<style>
+/* ─── ПЕРЕМЕННЫЕ И СБРОС ──────────────────────────────── */
+:root {
+  --bg:         #080c10;
+  --surface:    #0d1520;
+  --surface2:   #111d2e;
+  --border:     #1e3048;
+  --accent:     #00d4ff;
+  --accent2:    #0077ff;
+  --text:       #c8dff0;
+  --text-dim:   #4a6a8a;
+  --danger:     #ff4466;
+  --success:    #00e676;
+  --font-mono:  'Courier New', 'Lucida Console', monospace;
+  --font-main:  Georgia, 'Times New Roman', serif;
+  --radius:     8px;
+  --shadow:     0 8px 32px rgba(0,0,0,0.6);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-main);
+  overflow: hidden;
+}
+
+/* ─── ЭКРАН ЗАГРУЗКИ / ЗАНЯТО ─────────────────────────── */
+#screen-loading, #screen-busy, #screen-error {
+  position: fixed; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  background: var(--bg);
+  z-index: 100;
+}
+
+.logo {
+  font-family: var(--font-mono);
+  font-size: clamp(1.4rem, 4vw, 2.2rem);
+  letter-spacing: 0.15em;
+  color: var(--accent);
+  text-shadow: 0 0 20px rgba(0,212,255,0.4);
+  margin-bottom: 1.5rem;
+}
+.logo span { color: var(--text-dim); }
+
+.status-msg {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  letter-spacing: 0.1em;
+}
+
+.spinner {
+  width: 36px; height: 36px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-bottom: 1.2rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Занято */
+.busy-icon {
+  font-size: 3rem;
+  margin-bottom: 1rem;
+  filter: drop-shadow(0 0 12px var(--danger));
+}
+.busy-title {
+  font-size: clamp(1.2rem, 3vw, 1.8rem);
+  color: var(--danger);
+  margin-bottom: 0.75rem;
+  text-align: center;
+}
+.busy-sub {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  text-align: center;
+  line-height: 1.8;
+}
+.retry-btn {
+  margin-top: 1.5rem;
+  padding: 0.6rem 1.6rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+.retry-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ─── ОСНОВНОЙ LAYOUT ─────────────────────────────────── */
+#screen-main {
+  display: none;
+  width: 100vw; height: 100vh;
+  position: relative;
+  background: #000;
+}
+
+/* Удалённое видео — 80% высоты, полная ширина */
+#remote-video {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 80vh;
+  object-fit: cover;
+  background: #000;
+  z-index: 1;
+}
+
+/* Заглушка когда remote видео не подключено */
+#remote-placeholder {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 80vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #080c10 0%, #0d1520 100%);
+  z-index: 2;
+  gap: 1rem;
+}
+#remote-placeholder .ph-icon {
+  font-size: 3rem;
+  opacity: 0.3;
+}
+#remote-placeholder .ph-text {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  letter-spacing: 0.1em;
+}
+
+/* Локальное видео — selfie в углу */
+#local-video {
+  position: fixed;
+  bottom: 12px;
+  right: 12px;
+  width: clamp(120px, 20vw, 280px);
+  height: auto;
+  aspect-ratio: 4/3;
+  object-fit: cover;
+  z-index: 10;
+  border-radius: 10px;
+  border: 2px solid rgba(0, 212, 255, 0.3);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.7), 0 0 12px rgba(0,212,255,0.15);
+  background: #000;
+  transform: scaleX(-1); /* Зеркало для selfie */
+}
+
+/* ─── ПАНЕЛЬ УПРАВЛЕНИЯ ───────────────────────────────── */
+#controls {
+  position: fixed;
+  bottom: 0; left: 0;
+  width: 100%; height: 20vh;
+  background: linear-gradient(to top, rgba(8,12,16,0.98) 60%, transparent);
+  z-index: 5;
+  display: flex;
+  align-items: flex-end;
+  padding-bottom: 8px;
+}
+
+.controls-inner {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+}
+
+/* Кнопки управления звонком */
+.ctrl-btn {
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.1rem;
+  transition: transform 0.15s, box-shadow 0.15s;
+  flex-shrink: 0;
+}
+.ctrl-btn:hover { transform: scale(1.1); }
+.ctrl-btn:active { transform: scale(0.95); }
+
+.ctrl-btn.mute   { background: var(--surface2); color: var(--text); }
+.ctrl-btn.cam    { background: var(--surface2); color: var(--text); }
+.ctrl-btn.hang   { background: var(--danger);   color: #fff; box-shadow: 0 0 12px rgba(255,68,102,0.4); }
+.ctrl-btn.active-off { background: var(--danger); color: #fff; }
+
+/* Статус соединения */
+.conn-status {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  letter-spacing: 0.06em;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.conn-status.connected { color: var(--success); }
+.conn-status.connecting { color: #ffaa00; }
+
+/* ─── ЧАТ ─────────────────────────────────────────────── */
+#chat-toggle {
+  position: fixed;
+  top: 12px; right: 12px;
+  z-index: 20;
+  background: rgba(13,21,32,0.85);
+  border: 1px solid var(--border);
+  border-radius: 50px;
+  padding: 6px 14px;
+  display: flex; align-items: center; gap: 8px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  transition: border-color 0.2s;
+  backdrop-filter: blur(8px);
+}
+#chat-toggle:hover { border-color: var(--accent); color: var(--text); }
+#chat-badge {
+  background: var(--accent);
+  color: #000;
+  border-radius: 50%;
+  width: 16px; height: 16px;
+  font-size: 0.6rem;
+  display: none;
+  align-items: center; justify-content: center;
+  font-weight: bold;
+}
+#chat-badge.visible { display: flex; }
+
+#chat-panel {
+  position: fixed;
+  top: 0; right: -360px;
+  width: min(340px, 90vw);
+  height: 100vh;
+  background: rgba(9, 14, 22, 0.97);
+  border-left: 1px solid var(--border);
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  backdrop-filter: blur(16px);
+}
+#chat-panel.open { right: 0; }
+
+.chat-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  flex-shrink: 0;
+}
+.chat-header h3 {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+}
+.chat-close {
+  background: none; border: none;
+  color: var(--text-dim);
+  cursor: pointer; font-size: 1.1rem;
+  padding: 4px;
+  transition: color 0.15s;
+}
+.chat-close:hover { color: var(--text); }
+
+#chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scroll-behavior: smooth;
+}
+#chat-messages::-webkit-scrollbar { width: 4px; }
+#chat-messages::-webkit-scrollbar-track { background: transparent; }
+#chat-messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.msg-bubble {
+  max-width: 86%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.msg-bubble.mine {
+  align-self: flex-end;
+  background: linear-gradient(135deg, var(--accent2), #0055cc);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+.msg-bubble.theirs {
+  align-self: flex-start;
+  background: var(--surface2);
+  color: var(--text);
+  border-bottom-left-radius: 4px;
+}
+.msg-meta {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: rgba(255,255,255,0.4);
+  margin-top: 3px;
+}
+
+.chat-input-row {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  display: flex; gap: 8px;
+  flex-shrink: 0;
+}
+#chat-input {
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 0.85rem;
+  outline: none;
+  resize: none;
+  min-height: 36px;
+  max-height: 90px;
+  line-height: 1.4;
+  font-family: var(--font-main);
+}
+#chat-input:focus { border-color: var(--accent); }
+#chat-send {
+  background: var(--accent2);
+  border: none;
+  border-radius: 6px;
+  padding: 0 14px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s;
+  align-self: flex-end;
+  height: 36px;
+}
+#chat-send:hover { background: var(--accent); color: #000; }
+
+/* ─── СЛОТ-ИНДИКАТОР ─────────────────────────────────── */
+#slot-indicator {
+  position: fixed;
+  top: 12px; left: 12px;
+  z-index: 20;
+  background: rgba(13,21,32,0.85);
+  border: 1px solid var(--border);
+  border-radius: 50px;
+  padding: 5px 12px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  letter-spacing: 0.08em;
+  backdrop-filter: blur(8px);
+}
+#slot-indicator span { color: var(--accent); }
+
+/* ─── УВЕДОМЛЕНИЕ ─────────────────────────────────────── */
+#toast {
+  position: fixed;
+  bottom: 22vh; left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: rgba(13,21,32,0.95);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 20px;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text);
+  z-index: 50;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s, transform 0.3s;
+  white-space: nowrap;
+  backdrop-filter: blur(12px);
+}
+#toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ─── МЕДИАЗАПРОСЫ ────────────────────────────────────── */
+@media (max-width: 500px) {
+  #local-video {
+    width: 100px;
+    bottom: 8px; right: 8px;
+  }
+  #chat-panel { width: 100vw; }
+}
+
+/* Scan-line эффект поверх remote видео для атмосферы */
+#remote-video::after, .scanlines {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 80vh;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0,0,0,0.03) 2px,
+    rgba(0,0,0,0.03) 4px
+  );
+  pointer-events: none;
+  z-index: 3;
+}
+</style>
 </head>
 <body>
-  <h1>🎥 Видеозвонок для 2 абонентов (GitHub Pages)</h1>
-  <div id="status">Выберите действие</div>
 
+<!-- ─── ЭКРАН ЗАГРУЗКИ ─────────────────────────────────────── -->
+<div id="screen-loading">
+  <div class="logo">VIDEO<span>LINK</span></div>
+  <div class="spinner"></div>
+  <div class="status-msg" id="loading-msg">ИНИЦИАЛИЗАЦИЯ...</div>
+</div>
+
+<!-- ─── ЭКРАН ЗАНЯТО ───────────────────────────────────────── -->
+<div id="screen-busy" style="display:none">
+  <div class="logo">VIDEO<span>LINK</span></div>
+  <div class="busy-icon">⛔</div>
+  <div class="busy-title">Линия занята</div>
+  <div class="busy-sub">
+    Сейчас ведётся беседа.<br>
+    Подождите и попробуйте позже.
+  </div>
+  <button class="retry-btn" onclick="retryJoin()">↺ ПОВТОРИТЬ ПОПЫТКУ</button>
+</div>
+
+<!-- ─── ОСНОВНОЙ ЭКРАН ─────────────────────────────────────── -->
+<div id="screen-main">
+  <!-- Слот-индикатор -->
+  <div id="slot-indicator">SLOT <span id="my-slot-num">?</span></div>
+
+  <!-- Кнопка чата -->
+  <div id="chat-toggle" onclick="toggleChat()">
+    💬 ЧАТ
+    <span id="chat-badge"></span>
+  </div>
+
+  <!-- Remote видео (80% высоты) -->
+  <video id="remote-video" autoplay playsinline></video>
+
+  <!-- Заглушка пока нет remote -->
+  <div id="remote-placeholder">
+    <div class="ph-icon">👤</div>
+    <div class="ph-text" id="ph-text">ОЖИДАНИЕ СОБЕСЕДНИКА...</div>
+  </div>
+
+  <!-- Scanlines overlay -->
+  <div class="scanlines"></div>
+
+  <!-- Локальное selfie видео (20%, fixed, overlay) -->
+  <video id="local-video" autoplay playsinline muted></video>
+
+  <!-- Панель управления -->
   <div id="controls">
-    <button onclick="createRoom()">Я Abonent 1 — создать комнату</button>
-    <button onclick="showJoinForm()">Я Abonent 2 — присоединиться</button>
+    <div class="controls-inner">
+      <button class="ctrl-btn mute" id="btn-mute"    onclick="toggleMute()"   title="Микрофон">🎤</button>
+      <button class="ctrl-btn cam"  id="btn-cam"     onclick="toggleCam()"    title="Камера">📷</button>
+      <button class="ctrl-btn hang" id="btn-hang"    onclick="hangUp()"       title="Завершить">📵</button>
+      <div class="conn-status" id="conn-status">ПОДКЛЮЧЕНИЕ...</div>
+    </div>
   </div>
 
-  <div id="joinForm" style="display:none;">
-    <input id="peerIdInput" placeholder="Вставьте ID комнаты от Abonent 1">
-    <button onclick="joinRoom()">Присоединиться</button>
+  <!-- Чат-панель -->
+  <div id="chat-panel">
+    <div class="chat-header">
+      <h3>💬 ТЕКСТОВЫЙ ЧАТ</h3>
+      <button class="chat-close" onclick="toggleChat()">✕</button>
+    </div>
+    <div id="chat-messages"></div>
+    <div class="chat-input-row">
+      <textarea id="chat-input" placeholder="Сообщение..." rows="1"
+        onkeydown="chatKeydown(event)"></textarea>
+      <button id="chat-send" onclick="sendMessage()">➤</button>
+    </div>
   </div>
+</div>
 
-  <div id="shareLink" style="display:none;"></div>
+<!-- Тост-уведомление -->
+<div id="toast"></div>
 
-  <video id="local" autoplay muted playsinline></video>
-  <video id="remote" autoplay playsinline></video>
+<script>
+// ═══════════════════════════════════════════════════════════════
+// КОНФИГУРАЦИЯ КЛИЕНТА
+// ═══════════════════════════════════════════════════════════════
 
-  <div id="chat" style="display:none;">
-    <div id="messages" style="height:200px;overflow-y:scroll;margin-bottom:10px;"></div>
-    <input id="msg" placeholder="Сообщение...">
-    <button onclick="sendChat()">Отправить</button>
-  </div>
+const CONFIG = {
+  stunServer:    '<?= STUN_SERVER ?>',
+  pingInterval:  3000,   // мс между ping-запросами
+  pollInterval:  900,    // мс между poll-запросами
+  peerTimeout:   12000,  // мс после которых peer считается offline
+  retryDelay:    5000,   // мс до повторного join при занятости
+};
 
-  <script>
-    let peer, conn, localStream, myRole;
-    const localVideo = document.getElementById('local');
-    const remoteVideo = document.getElementById('remote');
-    const statusEl = document.getElementById('status');
+// ═══════════════════════════════════════════════════════════════
+// ГЛОБАЛЬНОЕ СОСТОЯНИЕ КЛИЕНТА
+// ═══════════════════════════════════════════════════════════════
 
-    async function startMedia() {
-      localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
-      localVideo.srcObject = localStream;
+let myClientId   = null;   // Уникальный ID этого клиента
+let mySlot       = null;   // 1 или 2
+let peerSlot     = null;   // Слот собеседника
+let isCaller     = false;  // true если slot1 (создаёт offer)
+
+let pc           = null;   // RTCPeerConnection
+let localStream  = null;   // MediaStream (камера + микрофон)
+
+let pingTimer    = null;
+let pollTimer    = null;
+
+let msgOffset    = 0;      // Индекс последнего прочитанного сообщения
+let unreadCount  = 0;
+let chatOpen     = false;
+
+let peerLastSeen = 0;      // Когда последний раз видели peer
+let peerConnected = false; // WebRTC соединение установлено
+
+let micEnabled   = true;
+let camEnabled   = true;
+
+let isHungUp     = false;  // Флаг завершения звонка
+
+// ═══════════════════════════════════════════════════════════════
+// ИНИЦИАЛИЗАЦИЯ
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Точка входа — запускается при загрузке страницы.
+ * Восстанавливает clientId из localStorage если есть.
+ */
+window.addEventListener('load', () => {
+  myClientId = localStorage.getItem('vcClientId');
+  if (!myClientId) {
+    myClientId = randomHex(16);
+    localStorage.setItem('vcClientId', myClientId);
+  }
+  startJoin();
+});
+
+/**
+ * При закрытии вкладки — отправляем leave (best effort).
+ */
+window.addEventListener('beforeunload', () => {
+  if (mySlot && myClientId) {
+    navigator.sendBeacon(scriptUrl('leave'), formData({ clientId: myClientId, slot: mySlot }));
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// JOIN — ПОДКЛЮЧЕНИЕ К СЕССИИ
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Запрашивает слот у сервера.
+ * При успехе запускает инициализацию медиа и WebRTC.
+ */
+async function startJoin() {
+  setLoadingMsg('ЗАПРОС СЛОТА...');
+  showScreen('loading');
+
+  try {
+    const res = await api('join', { clientId: myClientId });
+
+    if (res.status === 'busy') {
+      showScreen('busy');
+      return;
     }
 
-    function createRoom() {
-      myRole = 1;
-      peer = new Peer(); // автоматически генерирует ID
-      peer.on('open', id => {
-        statusEl.innerHTML = `Вы — <b>Abonent 1</b><br>Поделитесь ссылкой с партнёром:`;
-        const link = `${location.origin}${location.pathname}?join=${id}`;
-        document.getElementById('shareLink').innerHTML = `🔗 <a href="${link}" target="_blank">${link}</a><br>(откройте в другом браузере)`;
-        document.getElementById('shareLink').style.display = 'block';
-        document.getElementById('controls').style.display = 'none';
-        startMedia();
-      });
+    mySlot   = res.slot;
+    peerSlot = res.peerSlot;
+    isCaller = (mySlot === 1); // Slot1 создаёт offer
 
-      peer.on('connection', setupConnection);
-      peer.on('call', handleIncomingCall);
-    }
+    document.getElementById('my-slot-num').textContent = mySlot;
 
-    function showJoinForm() {
-      document.getElementById('controls').style.display = 'none';
-      document.getElementById('joinForm').style.display = 'block';
-    }
+    setLoadingMsg('ЗАПРОС МЕДИА...');
+    await initMedia();
 
-    function joinRoom() {
-      const targetId = document.getElementById('peerIdInput').value.trim();
-      if (!targetId) return alert('Введите ID комнаты');
-      myRole = 2;
-      peer = new Peer();
-      peer.on('open', () => {
-        conn = peer.connect(targetId);
-        setupConnection(conn);
-        statusEl.textContent = 'Подключение к Abonent 1...';
-        startMedia();
-      });
-      peer.on('call', handleIncomingCall);
-    }
+    showScreen('main');
 
-    function setupConnection(c) {
-      conn = c;
-      conn.on('open', () => {
-        statusEl.textContent = 'Соединение установлено! Начинаем звонок...';
-        document.getElementById('chat').style.display = 'block';
-        if (myRole === 1) startCall();
-      });
+    // Запускаем heartbeat и polling
+    startPing();
+    startPolling();
 
-      conn.on('data', text => {
-        const div = document.createElement('div');
-        div.innerHTML = `<b>Abonent ${3-myRole}:</b> ${text}`;
-        document.getElementById('messages').appendChild(div);
-        document.getElementById('messages').scrollTop = 9999;
-      });
-    }
-
-    async function startCall() {
-      const call = peer.call(peer.id, localStream); // для Abonent 1
-      call.on('stream', stream => remoteVideo.srcObject = stream);
-    }
-
-    function handleIncomingCall(call) {
-      call.answer(localStream);
-      call.on('stream', stream => remoteVideo.srcObject = stream);
-    }
-
-    function sendChat() {
-      const input = document.getElementById('msg');
-      if (conn && input.value) {
-        conn.send(input.value);
-        const div = document.createElement('div');
-        div.innerHTML = `<b>Я:</b> ${input.value}`;
-        document.getElementById('messages').appendChild(div);
-        document.getElementById('messages').scrollTop = 9999;
-        input.value = '';
+    if (res.peerConnected) {
+      // Peer уже есть — если мы caller, сразу шлём offer
+      if (isCaller) {
+        await initiatCall();
       }
     }
 
-    // Enter в чате
-    document.getElementById('msg').addEventListener('keypress', e => {
-      if (e.key === 'Enter') sendChat();
+    toast(`Подключён как Абонент ${mySlot}`, 3000);
+
+  } catch (err) {
+    console.error('Join error:', err);
+    setLoadingMsg('ОШИБКА: ' + err.message);
+    setTimeout(startJoin, 5000);
+  }
+}
+
+/** Повторная попытка join (с кнопки "Повторить") */
+function retryJoin() {
+  startJoin();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// МЕДИА
+// ═══════════════════════════════════════════════════════════════
+
+/** Получает доступ к камере и микрофону пользователя */
+async function initMedia() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+      audio: { echoCancellation: true, noiseSuppression: true },
     });
-  </script>
+    document.getElementById('local-video').srcObject = localStream;
+  } catch (err) {
+    // Если нет видео — пробуем только аудио
+    console.warn('Media error, trying audio only:', err);
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      toast('Нет доступа к камере/микрофону', 4000);
+      throw new Error('Media access denied');
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// WebRTC — УПРАВЛЕНИЕ СОЕДИНЕНИЕМ
+// ═══════════════════════════════════════════════════════════════
+
+/** Создаёт RTCPeerConnection с нужными STUN-серверами */
+function createPeerConnection() {
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+
+  pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: CONFIG.stunServer },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+    ]
+  });
+
+  // Добавляем локальные треки
+  if (localStream) {
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  }
+
+  // Remote треки — отображаем видео собеседника
+  pc.ontrack = (event) => {
+    const remoteVideo = document.getElementById('remote-video');
+    if (remoteVideo.srcObject !== event.streams[0]) {
+      remoteVideo.srcObject = event.streams[0];
+      document.getElementById('remote-placeholder').style.display = 'none';
+      setConnStatus('СОЕДИНЕНО', 'connected');
+      peerConnected = true;
+    }
+  };
+
+  // ICE кандидаты — отправляем peer через сервер
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      api('post_ice', {
+        clientId: myClientId,
+        slot: mySlot,
+        candidate: JSON.stringify(event.candidate),
+      }).catch(console.warn);
+    }
+  };
+
+  // Состояние ICE соединения
+  pc.oniceconnectionstatechange = () => {
+    const state = pc.iceConnectionState;
+    console.log('ICE state:', state);
+    if (state === 'connected' || state === 'completed') {
+      setConnStatus('СОЕДИНЕНО', 'connected');
+      peerConnected = true;
+      document.getElementById('ph-text').textContent = 'СОЕДИНЕНИЕ УСТАНОВЛЕНО';
+    } else if (state === 'checking') {
+      setConnStatus('ПОДКЛЮЧЕНИЕ...', 'connecting');
+    } else if (state === 'failed' || state === 'disconnected') {
+      setConnStatus('РАЗРЫВ СОЕДИНЕНИЯ', '');
+      peerConnected = false;
+    }
+  };
+
+  return pc;
+}
+
+/**
+ * Caller (slot1) инициирует звонок:
+ * создаёт offer и отправляет его через сервер.
+ */
+async function initiatCall() {
+  console.log('Initiating call as caller (slot1)...');
+  setConnStatus('СОЗДАНИЕ OFFER...', 'connecting');
+
+  createPeerConnection();
+
+  const offer = await pc.createOffer({
+    offerToReceiveAudio: true,
+    offerToReceiveVideo: true,
+  });
+  await pc.setLocalDescription(offer);
+
+  await api('post_offer', {
+    clientId: myClientId,
+    slot: mySlot,
+    offer: JSON.stringify(offer),
+  });
+
+  setConnStatus('ОЖИДАНИЕ ОТВЕТА...', 'connecting');
+}
+
+/**
+ * Callee (slot2) получил offer — создаёт и отправляет answer.
+ */
+async function handleOffer(offerJson) {
+  console.log('Received offer, creating answer...');
+
+  createPeerConnection();
+  setConnStatus('ПОЛУЧЕН OFFER...', 'connecting');
+
+  const offer = JSON.parse(offerJson);
+  await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  await api('post_answer', {
+    clientId: myClientId,
+    slot: mySlot,
+    answer: JSON.stringify(answer),
+  });
+
+  setConnStatus('ОЖИДАНИЕ ICE...', 'connecting');
+}
+
+/** Caller получил answer */
+async function handleAnswer(answerJson) {
+  if (!pc || pc.signalingState === 'stable') return;
+  console.log('Received answer, setting remote description...');
+  const answer = JSON.parse(answerJson);
+  await pc.setRemoteDescription(new RTCSessionDescription(answer));
+}
+
+/** Получен ICE кандидат от peer */
+async function handleIceCandidate(candidateJson) {
+  if (!pc) return;
+  try {
+    const candidate = JSON.parse(candidateJson);
+    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (e) {
+    console.warn('ICE candidate error:', e);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HEARTBEAT (PING)
+// ═══════════════════════════════════════════════════════════════
+
+/** Периодически пингует сервер чтобы слот не истёк */
+function startPing() {
+  if (pingTimer) clearInterval(pingTimer);
+  pingTimer = setInterval(async () => {
+    if (!myClientId || !mySlot || isHungUp) return;
+    try {
+      await api('ping', { clientId: myClientId, slot: mySlot });
+    } catch (e) {
+      console.warn('Ping failed:', e);
+    }
+  }, CONFIG.pingInterval);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// POLLING — ПОЛУЧЕНИЕ СОБЫТИЙ ОТ СЕРВЕРА
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Периодически опрашивает сервер на предмет:
+ * - SDP offer/answer
+ * - ICE кандидатов
+ * - Новых сообщений чата
+ * - Изменения состояния peer
+ */
+function startPolling() {
+  if (pollTimer) clearTimeout(pollTimer);
+
+  const doPoll = async () => {
+    if (isHungUp) return;
+
+    try {
+      const data = await api('poll', {
+        clientId:  myClientId,
+        slot:      mySlot,
+        msgOffset: msgOffset,
+      });
+
+      if (data.status !== 'ok') return;
+
+      // ── Обработка сигналинга ───────────────────────────────
+
+      // Если пришёл offer (для callee)
+      if (data.offers && data.offers.length > 0) {
+        for (const offerJson of data.offers) {
+          await handleOffer(offerJson);
+        }
+      }
+
+      // Если пришёл answer (для caller)
+      if (data.answers && data.answers.length > 0) {
+        for (const answerJson of data.answers) {
+          await handleAnswer(answerJson);
+        }
+      }
+
+      // ICE кандидаты
+      if (data.ices && data.ices.length > 0) {
+        for (const ice of data.ices) {
+          await handleIceCandidate(ice);
+        }
+      }
+
+      // ── Обработка чата ─────────────────────────────────────
+
+      if (data.msgs && data.msgs.length > 0) {
+        for (const msg of data.msgs) {
+          renderMessage(msg);
+          if (!chatOpen && msg.from !== mySlot) {
+            unreadCount++;
+            updateBadge();
+          }
+        }
+        msgOffset = data.msgTotal;
+        scrollChatToBottom();
+      }
+
+      // ── Состояние peer ─────────────────────────────────────
+
+      if (data.peerConnected) {
+        peerLastSeen = Date.now();
+
+        // Если peer подключился и мы caller — инициируем звонок
+        if (isCaller && (!pc || pc.signalingState === 'closed' || pc.signalingState === 'stable' && !peerConnected)) {
+          // Проверяем что не уже в процессе
+          if (!pc || pc.signalingState === 'closed') {
+            await initiatCall();
+          }
+        }
+
+        document.getElementById('remote-placeholder').style.display = 'none';
+        if (!peerConnected) {
+          document.getElementById('ph-text').textContent = 'УСТАНОВКА СОЕДИНЕНИЯ...';
+        }
+
+      } else {
+        // Peer отсутствует
+        const wasConnected = peerLastSeen > 0;
+        if (wasConnected && Date.now() - peerLastSeen > CONFIG.peerTimeout) {
+          onPeerLeft();
+        }
+        document.getElementById('remote-placeholder').style.display = 'flex';
+        document.getElementById('ph-text').textContent = 'ОЖИДАНИЕ СОБЕСЕДНИКА...';
+      }
+
+    } catch (err) {
+      console.warn('Poll error:', err);
+    }
+
+    // Планируем следующий poll
+    if (!isHungUp) {
+      pollTimer = setTimeout(doPoll, CONFIG.pollInterval);
+    }
+  };
+
+  doPoll();
+}
+
+/** Вызывается когда peer отключился */
+function onPeerLeft() {
+  if (peerConnected || peerLastSeen === 0) {
+    peerConnected = false;
+    peerLastSeen  = 0;
+
+    // Закрываем PC — при переподключении создадим новый
+    if (pc) {
+      pc.close();
+      pc = null;
+    }
+
+    const remoteVideo = document.getElementById('remote-video');
+    remoteVideo.srcObject = null;
+    document.getElementById('remote-placeholder').style.display = 'flex';
+    document.getElementById('ph-text').textContent = 'СОБЕСЕДНИК ОТКЛЮЧИЛСЯ';
+    setConnStatus('ОЖИДАНИЕ...', '');
+
+    toast('Собеседник покинул сессию', 4000);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ЧАТ
+// ═══════════════════════════════════════════════════════════════
+
+/** Отправляет текстовое сообщение */
+async function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+
+  try {
+    await api('post_msg', {
+      clientId: myClientId,
+      slot: mySlot,
+      text: text,
+    });
+  } catch (e) {
+    toast('Ошибка отправки сообщения', 2000);
+  }
+}
+
+/** Enter без Shift отправляет сообщение */
+function chatKeydown(event) {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    sendMessage();
+  }
+  // Авто-высота textarea
+  setTimeout(() => {
+    const el = event.target;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 90) + 'px';
+  }, 0);
+}
+
+/**
+ * Рендерит сообщение чата в DOM.
+ * Экранирует HTML для безопасности.
+ */
+function renderMessage(msg) {
+  const container = document.getElementById('chat-messages');
+  const isMine = (msg.from === mySlot);
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble ' + (isMine ? 'mine' : 'theirs');
+
+  const text = document.createElement('div');
+  text.textContent = msg.text; // textContent безопасно (не innerHTML!)
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+  meta.textContent = formatTime(msg.ts) + (isMine ? ' · вы' : ' · собеседник');
+
+  bubble.appendChild(text);
+  bubble.appendChild(meta);
+  container.appendChild(bubble);
+}
+
+function scrollChatToBottom() {
+  const el = document.getElementById('chat-messages');
+  el.scrollTop = el.scrollHeight;
+}
+
+function toggleChat() {
+  chatOpen = !chatOpen;
+  document.getElementById('chat-panel').classList.toggle('open', chatOpen);
+  if (chatOpen) {
+    unreadCount = 0;
+    updateBadge();
+    scrollChatToBottom();
+    document.getElementById('chat-input').focus();
+  }
+}
+
+function updateBadge() {
+  const badge = document.getElementById('chat-badge');
+  if (unreadCount > 0) {
+    badge.textContent = unreadCount > 9 ? '9+' : unreadCount;
+    badge.classList.add('visible');
+  } else {
+    badge.classList.remove('visible');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// УПРАВЛЕНИЕ МЕДИА
+// ═══════════════════════════════════════════════════════════════
+
+function toggleMute() {
+  if (!localStream) return;
+  micEnabled = !micEnabled;
+  localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+  const btn = document.getElementById('btn-mute');
+  btn.textContent = micEnabled ? '🎤' : '🔇';
+  btn.classList.toggle('active-off', !micEnabled);
+  toast(micEnabled ? 'Микрофон включён' : 'Микрофон выключен', 2000);
+}
+
+function toggleCam() {
+  if (!localStream) return;
+  camEnabled = !camEnabled;
+  localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
+  const btn = document.getElementById('btn-cam');
+  btn.textContent = camEnabled ? '📷' : '🚫';
+  btn.classList.toggle('active-off', !camEnabled);
+  toast(camEnabled ? 'Камера включена' : 'Камера выключена', 2000);
+}
+
+/** Завершает звонок и очищает ресурсы */
+async function hangUp() {
+  isHungUp = true;
+
+  if (pingTimer) clearInterval(pingTimer);
+  if (pollTimer) clearTimeout(pollTimer);
+
+  if (pc) { pc.close(); pc = null; }
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+
+  try {
+    await api('leave', { clientId: myClientId, slot: mySlot });
+  } catch (e) {}
+
+  // Перезагружаем страницу для повторного подключения
+  setTimeout(() => window.location.reload(), 1500);
+  toast('Звонок завершён. Перезапуск...', 1500);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ═══════════════════════════════════════════════════════════════
+
+/** Формирует URL для API-запроса */
+function scriptUrl(action) {
+  return '?action=' + encodeURIComponent(action);
+}
+
+/**
+ * Выполняет POST-запрос к API.
+ * Возвращает распарсенный JSON.
+ */
+async function api(action, params = {}) {
+  const body = new URLSearchParams({ action, ...params });
+  const res = await fetch(window.location.pathname + '?action=' + action, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+/** Создаёт FormData из объекта (для sendBeacon) */
+function formData(obj) {
+  const fd = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj)) fd.append(k, v);
+  return fd;
+}
+
+/** Генерирует случайный hex-string */
+function randomHex(len) {
+  const arr = new Uint8Array(len / 2);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Форматирует unix timestamp в HH:MM */
+function formatTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+}
+
+/** Показывает нужный экран */
+function showScreen(name) {
+  document.getElementById('screen-loading').style.display = name === 'loading' ? 'flex' : 'none';
+  document.getElementById('screen-busy').style.display    = name === 'busy'    ? 'flex' : 'none';
+  document.getElementById('screen-main').style.display    = name === 'main'    ? 'block': 'none';
+}
+
+function setLoadingMsg(msg) {
+  document.getElementById('loading-msg').textContent = msg;
+}
+
+function setConnStatus(msg, cls) {
+  const el = document.getElementById('conn-status');
+  el.textContent = msg;
+  el.className = 'conn-status ' + (cls || '');
+}
+
+/** Показывает временное уведомление */
+let toastTimer = null;
+function toast(msg, duration = 3000) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), duration);
+}
+</script>
 </body>
 </html>
